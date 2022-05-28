@@ -330,6 +330,7 @@ static const Name START_REWIND = "start_rewind";
 static const Name STOP_REWIND = "stop_rewind";
 static const Name ASYNCIFY_GET_CALL_INDEX = "__asyncify_get_call_index";
 static const Name ASYNCIFY_CHECK_CALL_INDEX = "__asyncify_check_call_index";
+static const Name ASYNCIFY_BUFFER_TABLE = "__asyncify_buffer_table";
 
 // TODO: having just normal/unwind_or_rewind would decrease code
 //       size, but make debugging harder
@@ -1368,7 +1369,13 @@ private:
       if (!relevantLiveLocals.count(i)) {
         continue;
       }
-      total += getByteSize(func->getLocalType(i));
+      auto localType = func->getLocalType(i);
+      // TODO[doe]: I'm not sure about tuple unpacking here, revisit, verify
+      for (const auto& type : localType) {
+        if (type.hasByteSize()) {
+          total += type.getByteSize();
+        }
+      }
     }
     auto* block = builder->makeBlock();
     block->list.push_back(builder->makeIncStackPos(-total));
@@ -1376,6 +1383,7 @@ private:
     block->list.push_back(
       builder->makeLocalSet(tempIndex, builder->makeGetStackPos()));
     Index offset = 0;
+    Index table_idx = 0;
     for (Index i = 0; i < numLocals; i++) {
       if (!relevantLiveLocals.count(i)) {
         continue;
@@ -1383,17 +1391,26 @@ private:
       auto localType = func->getLocalType(i);
       SmallVector<Expression*, 1> loads;
       for (const auto& type : localType) {
-        auto size = getByteSize(type);
-        assert(size % STACK_ALIGN == 0);
-        // TODO: higher alignment?
-        loads.push_back(
-          builder->makeLoad(size,
-                            true,
-                            offset,
-                            STACK_ALIGN,
-                            builder->makeLocalGet(tempIndex, Type::i32),
-                            type));
-        offset += size;
+        if (type.hasByteSize()) {
+          auto size = type.getByteSize();
+          assert(size % STACK_ALIGN == 0);
+          // TODO: higher alignment?
+          loads.push_back(
+            builder->makeLoad(size,
+                              true,
+                              offset,
+                              STACK_ALIGN,
+                              builder->makeLocalGet(tempIndex, Type::i32),
+                              type));
+          offset += size;
+        } else {
+          // TODO[doe]: revisit, verify
+          loads.push_back(
+            builder->makeTableGet(ASYNCIFY_BUFFER_TABLE,
+                                  builder->makeConst(Index(table_idx)),
+                                  type));
+          ++table_idx;
+        }
       }
       Expression* load;
       if (loads.size() == 1) {
@@ -1420,6 +1437,7 @@ private:
     block->list.push_back(
       builder->makeLocalSet(tempIndex, builder->makeGetStackPos()));
     Index offset = 0;
+    Index table_idx = 0;
     for (Index i = 0; i < numLocals; i++) {
       if (!relevantLiveLocals.count(i)) {
         continue;
@@ -1427,21 +1445,30 @@ private:
       auto localType = func->getLocalType(i);
       size_t j = 0;
       for (const auto& type : localType) {
-        auto size = getByteSize(type);
         Expression* localGet = builder->makeLocalGet(i, localType);
         if (localType.size() > 1) {
           localGet = builder->makeTupleExtract(localGet, j);
         }
-        assert(size % STACK_ALIGN == 0);
-        // TODO: higher alignment?
-        block->list.push_back(
-          builder->makeStore(size,
-                             offset,
-                             STACK_ALIGN,
-                             builder->makeLocalGet(tempIndex, Type::i32),
-                             localGet,
-                             type));
-        offset += size;
+        if (type.hasByteSize()) {
+          auto size = type.getByteSize();
+          assert(size % STACK_ALIGN == 0);
+          // TODO: higher alignment?
+          block->list.push_back(
+            builder->makeStore(size,
+                               offset,
+                               STACK_ALIGN,
+                               builder->makeLocalGet(tempIndex, Type::i32),
+                               localGet,
+                               type));
+          offset += size;
+        } else {
+          // TODO[doe]: revisit, verify
+          block->list.push_back(
+            builder->makeTableSet(ASYNCIFY_BUFFER_TABLE,
+                                  builder->makeConst(Index(table_idx)),
+                                  localGet));
+          ++table_idx;
+        }
         ++j;
       }
     }
@@ -1460,15 +1487,6 @@ private:
                          builder->makeLocalGet(tempIndex, Type::i32),
                          Type::i32),
       builder->makeIncStackPos(4));
-  }
-
-  unsigned getByteSize(Type type) {
-    if (!type.hasByteSize()) {
-      Fatal() << "Asyncify does not yet support non-number types, like "
-                 "references (see "
-                 "https://github.com/WebAssembly/binaryen/issues/3739)";
-    }
-    return type.getByteSize();
   }
 };
 
@@ -1561,6 +1579,9 @@ struct Asyncify : public Pass {
     // Add necessary globals before we emit code to use them.
     addGlobals(module, relocatable);
 
+    // TODO[doe]: revisit, not sure if it's a good place to add the table
+    addTable(module);
+
     // Instrument the flow of code, adding code instrumentation and
     // skips for when rewinding. We do this on flat IR so that it is
     // practical to add code around each call, without affecting
@@ -1636,6 +1657,16 @@ private:
       asyncifyData->base = ASYNCIFY_DATA;
     }
     module->addGlobal(std::move(asyncifyData));
+  }
+
+  // TODO[doe]: Revisit: name, initial, max
+  void addTable(Module* module) {
+    Builder builder(*module);
+    auto buffer_table = builder.makeTable(ASYNCIFY_BUFFER_TABLE,
+                                          Type::anyref,
+                                          0,
+                                          0);
+    module->addTable(std::move(buffer_table));
   }
 
   void addFunctions(Module* module) {
